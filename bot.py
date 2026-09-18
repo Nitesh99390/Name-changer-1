@@ -23,8 +23,10 @@
 
 import os
 import re
+import sys
 import json
 import time
+import signal
 import random
 import hashlib
 import logging
@@ -32,21 +34,41 @@ import sqlite3
 import zipfile
 import shutil
 import asyncio
+import platform
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Tuple
-from functools import lru_cache
+
+# ---------------------------------------------------------------------
+# ⚙️  EVENT-LOOP SAFETY SHIM  (fixes the Render crash!)
+# ---------------------------------------------------------------------
+#  On Python 3.12+ `asyncio.get_event_loop()` raises:
+#     RuntimeError: There is no current event loop in thread 'MainThread'
+#  Old Pyrogram calls it at IMPORT time, so the bot dies instantly.
+#  We proactively install a loop on the main thread BEFORE importing
+#  Pyrogram so that even a legacy version can import cleanly.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+# --- Optional .env support for local development ---------------------
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import docx
 from bs4 import BeautifulSoup
 from aiohttp import web
 
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, idle, __version__ as PYRO_VERSION
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, BotCommand
 )
 from pyrogram.enums import ParseMode, ChatAction
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, RPCError
 
 # =====================================================================
 # 1. CONFIGURATION & LOGGING
@@ -55,26 +77,47 @@ from pyrogram.errors import FloodWait
 # ⚠️  SECURITY: Kabhi bhi real values code mein paste NA karein.
 #     Render/Heroku mein Environment Variables set karein:
 #       API_ID, API_HASH, BOT_TOKEN, ADMIN_ID
-API_ID    = int(os.environ.get("API_ID", "0"))
-API_HASH  = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID  = int(os.environ.get("ADMIN_ID", "0"))
 
-DB_FILE      = "bot_stats.db"
-DOWNLOAD_DIR = "downloads"
-MAX_FILE_MB  = 50
-RATE_LIMIT_S = 15          # ek user 15 sec mein sirf 1 file
-LOG_FILE     = "bot.log"
+
+def _env_int(name: str, default: int) -> int:
+    """Env variable ko safely int mein badalta hai (galat value par default)."""
+    raw = os.environ.get(name, "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+API_ID    = _env_int("API_ID", 0)
+API_HASH  = os.environ.get("API_HASH", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_ID  = _env_int("ADMIN_ID", 0)
+
+DB_FILE      = os.environ.get("DB_FILE", "bot_stats.db")
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
+MAX_FILE_MB  = _env_int("MAX_FILE_MB", 50)
+RATE_LIMIT_S = _env_int("RATE_LIMIT_S", 15)   # ek user X sec mein sirf 1 file
+LOG_FILE     = os.environ.get("LOG_FILE", "bot.log")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # --- Logging: console + rotating file (2 MB x 3 backups) ---
 _formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
-_fh = RotatingFileHandler(LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
-_fh.setFormatter(_formatter)
-_ch = logging.StreamHandler()
-_ch.setFormatter(_formatter)
-logging.basicConfig(level=logging.INFO, handlers=[_fh, _ch])
+_handlers = [logging.StreamHandler(sys.stdout)]
+_handlers[0].setFormatter(_formatter)
+
+# File logging optional hai — read-only FS (kuch hosts) par crash nahi hoga.
+try:
+    _fh = RotatingFileHandler(LOG_FILE, maxBytes=2 * 1024 * 1024,
+                              backupCount=3, encoding="utf-8")
+    _fh.setFormatter(_formatter)
+    _handlers.append(_fh)
+except OSError:
+    pass
+
+logging.basicConfig(level=logging.INFO, handlers=_handlers)
+# Pyrogram ke bade INFO spam ko dabao — sirf warnings/errors dikhao.
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logger = logging.getLogger("NovelBot")
 
 # =====================================================================
@@ -666,20 +709,44 @@ async def broadcast_cmd(client: Client, message: Message):
     except IndexError:
         return await message.reply("⚠️ Usage: `/broadcast <message>`", parse_mode=ParseMode.MARKDOWN)
 
-    status = await message.reply("📢 Broadcast shuru ho raha hai...")
-    sent, failed = 0, 0
-    for uid in get_all_user_ids():
+    user_ids = get_all_user_ids()
+    status = await message.reply(f"📢 Broadcast shuru... (`{len(user_ids)}` users)",
+                                 parse_mode=ParseMode.MARKDOWN)
+    sent, failed, blocked = 0, 0, 0
+    for i, uid in enumerate(user_ids, 1):
         try:
             await client.send_message(uid, f"📢 **Admin Message:**\n\n{text}",
                                       parse_mode=ParseMode.MARKDOWN)
             sent += 1
         except FloodWait as e:
-            await asyncio.sleep(e.value)
-        except Exception:
-            failed += 1
+            # Wait, phir SAME user ko dobara bhejo (warna miss ho jata)
+            await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
+            try:
+                await client.send_message(uid, f"📢 **Admin Message:**\n\n{text}",
+                                          parse_mode=ParseMode.MARKDOWN)
+                sent += 1
+            except Exception:
+                failed += 1
+        except Exception as e:
+            # User ne block kiya / account deleted
+            if "USER_IS_BLOCKED" in str(e) or "PEER_ID_INVALID" in str(e):
+                blocked += 1
+            else:
+                failed += 1
+        # Har 25 users par progress update
+        if i % 25 == 0:
+            try:
+                await status.edit_text(
+                    f"📢 Broadcasting... `{i}/{len(user_ids)}`\n"
+                    f"✅ `{sent}`  ❌ `{failed}`  🚫 `{blocked}`",
+                    parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
         await asyncio.sleep(0.05)   # flood-safe pacing
-    await status.edit_text(f"📢 **Broadcast Complete**\n\n✅ Sent: `{sent}`\n❌ Failed: `{failed}`",
-                           parse_mode=ParseMode.MARKDOWN)
+    await status.edit_text(
+        f"📢 **Broadcast Complete**\n\n"
+        f"✅ Sent: `{sent}`\n❌ Failed: `{failed}`\n🚫 Blocked/Invalid: `{blocked}`",
+        parse_mode=ParseMode.MARKDOWN)
 
 
 # =====================================================================
@@ -895,54 +962,139 @@ async def web_handler(request):
     })
 
 
-async def start_web_server():
-    port = int(os.environ.get("PORT", 8080))
+async def start_web_server() -> web.AppRunner:
+    port = _env_int("PORT", 8080)
     web_app = web.Application()
     web_app.router.add_get("/", web_handler)
     web_app.router.add_get("/health", web_handler)
+    web_app.router.add_get("/ping", lambda r: web.Response(text="pong"))
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info(f"🌐 Web server live on port {port} (/health endpoint ready)")
+    return runner
 
 
 # =====================================================================
 # 14. MAIN LOOP  (startup + graceful shutdown)
 # =====================================================================
 
-async def main():
-    if not all([API_ID, API_HASH, BOT_TOKEN]):
+def _validate_config():
+    """Startup se pehle zaroori env variables check karta hai."""
+    missing = []
+    if not API_ID:
+        missing.append("API_ID")
+    if not API_HASH:
+        missing.append("API_HASH")
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if missing:
         raise SystemExit(
-            "❌ API_ID / API_HASH / BOT_TOKEN environment variables set nahi hain!\n"
-            "   Render dashboard -> Environment mein add karein."
+            "❌ In environment variables ki value set nahi hai: "
+            f"{', '.join(missing)}\n"
+            "   Render dashboard -> Environment mein inhe add karein.\n"
+            "   (Local testing ke liye .env file bana sakte hain — dekho .env.example)"
         )
+
+
+async def _set_bot_commands():
+    try:
+        await app.set_bot_commands([
+            BotCommand("start", "Bot ko start karein"),
+            BotCommand("help", "Madad aur instructions"),
+            BotCommand("addmap", "Custom naam mapping add karein"),
+            BotCommand("mymap", "Apni dictionary dekhein"),
+            BotCommand("clearmap", "Custom dictionary saaf karein"),
+            BotCommand("engine", "Translation engine ki jaankari"),
+            BotCommand("ping", "Bot status check"),
+            BotCommand("stats", "Statistics (Admin only)"),
+            BotCommand("broadcast", "Sabko message (Admin only)"),
+        ])
+    except RPCError as e:
+        logger.warning(f"⚠️ set_bot_commands fail hua (ignore kar rahe hain): {e}")
+
+
+async def main():
+    _validate_config()
+
+    logger.info("=" * 60)
+    logger.info("🚀 Advanced Novel Translator Bot start ho raha hai...")
+    logger.info(f"   Python {platform.python_version()} | Pyrogram {PYRO_VERSION}")
+    logger.info("=" * 60)
 
     init_db()
     load_custom_maps()
     generate_and_load_mapping()
-    await start_web_server()
 
-    await app.start()
+    web_runner = await start_web_server()
+
+    # --- Telegram connect with retry (network flake par bhi crash nahi) ---
+    for attempt in range(1, 6):
+        try:
+            await app.start()
+            break
+        except Exception as e:
+            wait = min(attempt * 5, 30)
+            logger.error(f"⚠️ Telegram connect fail (try {attempt}/5): {e} "
+                         f"— {wait}s baad retry...")
+            await asyncio.sleep(wait)
+    else:
+        logger.critical("❌ Telegram se 5 baar connect nahi ho paya. Band kar rahe hain.")
+        await web_runner.cleanup()
+        raise SystemExit(1)
+
     me = await app.get_me()
-    logger.info(f"🤖 Bot online: @{me.username}")
+    logger.info(f"🤖 Bot online: @{me.username} (id: {me.id})")
+    await _set_bot_commands()
 
-    await app.set_bot_commands([
-        BotCommand("start", "Bot ko start karein"),
-        BotCommand("help", "Madad aur instructions"),
-        BotCommand("addmap", "Custom naam mapping add karein"),
-        BotCommand("mymap", "Apni dictionary dekhein"),
-        BotCommand("clearmap", "Custom dictionary saaf karein"),
-        BotCommand("engine", "Translation engine ki jaankari"),
-        BotCommand("ping", "Bot status check"),
-        BotCommand("stats", "Statistics (Admin only)"),
-        BotCommand("broadcast", "Sabko message (Admin only)")
-    ])
+    # --- Graceful shutdown signals (SIGINT / SIGTERM) ---
+    stop_event = asyncio.Event()
 
-    await idle()                      # bot yahan chalta rahega
-    await app.stop()                  # Ctrl+C par clean shutdown
-    logger.info("👋 Bot safely band ho gaya.")
+    def _request_stop(*_):
+        logger.info("🛑 Shutdown signal mila — safely band kar rahe hain...")
+        stop_event.set()
+
+    loop = asyncio.get_event_loop()
+    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except (NotImplementedError, RuntimeError):
+            # Windows / kuch env signal handlers support nahi karte
+            pass
+
+    logger.info("✅ Bot poori tarah taiyaar hai. Messages ka intezaar...")
+
+    # idle() aur stop_event dono mein se jo pehle aaye
+    try:
+        idle_task = asyncio.create_task(idle())
+        stop_task = asyncio.create_task(stop_event.wait())
+        await asyncio.wait({idle_task, stop_task},
+                           return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in (idle_task, stop_task):
+            if not t.done():
+                t.cancel()
+        try:
+            await app.stop()
+        except Exception:
+            pass
+        try:
+            await web_runner.cleanup()
+        except Exception:
+            pass
+        logger.info("👋 Bot safely band ho gaya.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 KeyboardInterrupt — bye!")
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.critical(f"💥 Fatal error: {e}", exc_info=True)
+        sys.exit(1)

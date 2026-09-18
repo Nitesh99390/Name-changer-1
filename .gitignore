@@ -1,0 +1,26 @@
+# Secrets
+.env
+
+# Pyrogram / bot runtime files
+*.session
+*.session-journal
+bot_stats.db
+bot_stats.db-wal
+bot_stats.db-shm
+bot.log
+bot.log.*
+downloads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

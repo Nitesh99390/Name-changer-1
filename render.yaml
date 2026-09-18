@@ -1,0 +1,37 @@
+# =====================================================================
+#  Render Blueprint  —  Advanced Novel Translator Bot
+# =====================================================================
+#  This lets Render auto-configure the service. On the Render dashboard
+#  choose "New +" -> "Blueprint" and point it at this repo.
+#
+#  A "worker" (not a "web") service is ideal for a Telegram bot, but if
+#  you are on Render's FREE tier you must use a "web" service (free tier
+#  has no background workers). This bot already runs an aiohttp
+#  health-check server on $PORT, so "web" works perfectly.
+# =====================================================================
+
+services:
+  - type: web
+    name: novel-translator-bot
+    runtime: python
+    plan: free
+    region: singapore          # change to a region near you (oregon, frankfurt, ...)
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: API_ID
+        sync: false            # set the real value in the dashboard
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        value: "0"
+      - key: MAX_FILE_MB
+        value: "50"
+      - key: RATE_LIMIT_S
+        value: "15"
