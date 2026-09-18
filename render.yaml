@@ -18,6 +18,7 @@ services:
     region: singapore          # change to a region near you (oregon, frankfurt, ...)
     buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
     startCommand: "python bot.py"
+    # Readiness: returns 503 until Telegram and the translation engine are ready.
     healthCheckPath: /health
     autoDeploy: true
     envVars:
@@ -34,4 +35,10 @@ services:
       - key: MAX_FILE_MB
         value: "50"
       - key: RATE_LIMIT_S
+        value: "15"
+      - key: CONNECT_RETRIES
+        value: "5"
+      - key: CONNECT_TIMEOUT_S
+        value: "60"
+      - key: SHUTDOWN_TIMEOUT_S
         value: "15"

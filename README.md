@@ -6,40 +6,75 @@ Ek Telegram bot jo **Chinese / Asian novel** ke character naamon ko
 
 ---
 
-## 🔴 Render "Deploy Failed" wala error — FIXED ✅
+## Render startup fix: one event loop
 
-Aapka bot Render par is error se crash ho raha tha:
+The reported error was:
 
 ```
-RuntimeError: There is no current event loop in thread 'MainThread'
-File ".../pyrogram/sync.py", line 33, in async_to_sync
-    main_loop = asyncio.get_event_loop()
+RuntimeError: Task ... got Future ... attached to a different loop
 ```
 
-### Wajah (Root Cause)
-- Purana **official `pyrogram`** (Dan wala) ab **maintain nahi hota**.
-- Render ab **Python 3.13** use karta hai. Python 3.12+ mein
-  `asyncio.get_event_loop()` ab loop auto-create nahi karta — seedha
-  `RuntimeError` deta hai.
-- Purana Pyrogram yeh call **import ke time** karta tha, isliye bot
-  start hote hi mar jata tha (Exit status 1).
+The previous import-time shim created a loop for the Telegram client and its
+handlers, but `asyncio.run(main())` created another loop for startup. Retrying
+could not fix this mismatch. `run_bot()` now uses `asyncio.Runner` with the
+**same loop** used by Kurigram, including handler registration and shutdown.
+Do not replace this entrypoint with `asyncio.run(main())`.
 
-### Fix (kya badla)
-1. **`requirements.txt`** — `pyrogram` ki jagah **`kurigram`** (actively
-   maintained Pyrogram fork) use kiya. Yeh Python 3.12/3.13 par chalta
-   hai aur event-loop bug fix karta hai. Import same rehta hai
-   (`import pyrogram`), code change karne ki zaroorat nahi.
-2. **`runtime.txt` + `render.yaml`** — Python `3.11.9` pin kiya (extra
-   safety), taaki host apne aap koi tooti version na le aaye.
-3. **`bot.py`** — top par ek **event-loop safety shim** add ki jo import
-   se pehle hi loop bana deti hai — double protection.
+### Reliability and safety improvements
+
+- Configurable connection retry count and startup deadline. Network/server
+  failures retry with exponential backoff and jitter; invalid credentials and
+  programming errors fail immediately. Short Telegram FloodWaits are respected.
+- A timed-out startup exits instead of reusing a possibly incomplete session;
+  the hosting supervisor can restart it. Cleanup failure also prevents retries.
+- SIGINT/SIGTERM interrupt startup, retry delays and normal operation. Telegram
+  cleanup is time-bounded, and web resources are closed even on startup failure.
+- `/health` and `/ready` return **503** until the engine and Telegram session
+  are ready, and during a detected session disconnect. `/` gives JSON status;
+  `/ping` is HTTP liveness only. No credentials are exposed in these responses.
+- `/stats` and `/broadcast` are disabled when `ADMIN_ID` is unset or zero.
+- JSON dictionaries obey the upload-size limit and accept at most 5,000
+  non-empty string pairs per upload, with 200 characters per key/value. Database
+  writes are transactional. Temporary filenames include the message ID to
+  avoid collisions; file statistics increment only after successful upload.
+
+### Existing Render service: redeploy steps
+
+1. Merge the fix PR into the branch your Render service deploys (usually `main`).
+2. In **Environment**, set `PYTHON_VERSION=3.11.9`, matching `.python-version`,
+   `render.yaml` and `runtime.txt`. Render reads `.python-version`; `runtime.txt`
+   alone is not its supported version selector. An existing dashboard
+   `PYTHON_VERSION` takes precedence, and changing a Blueprint does not
+   automatically configure a manually created service.
+3. Verify `API_ID`, `API_HASH`, and `BOT_TOKEN`. Do not paste them into source
+   code or public logs. Set your Telegram user ID as `ADMIN_ID` if needed.
+4. Set build command to `pip install -r requirements.txt`, start command to
+   `python bot.py`, and health-check path to `/health`.
+5. Choose **Manual Deploy -> Clear build cache & deploy**. Confirm the Python
+   version in logs, then wait for `Telegram and translation engine ready`.
+6. Check `/health` returns HTTP 200 with `telegram_connected: true`, then send
+   `/start`, `/ping`, and a small novel file in Telegram.
+
+Render's free web service can still sleep during inactivity; these fixes do
+not provide always-on hosting. SQLite dictionaries/stats remain service-wide
+and require persistent storage to survive ephemeral-host redeploys.
+
+### Offline regression tests
+
+```bash
+python -m unittest -v test_bot
+```
+
+Tests use the real Kurigram loop/handler registration plus mocked Telegram
+calls for retries, timeouts, shutdown, health checks and access checks. They do
+not contact Telegram; a successful live deployment must be verified separately.
 
 ---
 
 ## 🚀 Naye / Advanced Features
 
-- ⚡ **Event-loop safety shim** — kisi bhi Python version par crash nahi.
-- 🔁 **Connect retry** — Telegram se connect fail ho to 5 baar auto-retry.
+- **Single-loop lifecycle** — client, handlers aur startup ek hi event loop use karte hain.
+- **Selective connect retry** — temporary network/server errors par bounded retries.
 - 🛑 **Graceful shutdown** — SIGINT/SIGTERM par bot safely band hota hai
   (Render restart par clean).
 - 🧾 **`.env` support** — local testing ke liye `.env` file (dekho
