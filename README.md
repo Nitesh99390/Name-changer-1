@@ -6,6 +6,109 @@ Ek Telegram bot jo **Chinese / Asian novel** ke character naamon ko
 
 ---
 
+## Render port timeout and character coverage update
+
+The screenshot shows **build successful**, followed by:
+
+```
+Port scan timeout reached, no open ports detected.
+Bind your service to at least one port.
+```
+
+This is a runtime port-binding failure, not a pip installation error. The
+screenshot alone does not identify which pre-bind startup step stalled. The
+updated startup binds **0.0.0.0:$PORT first**, before database/engine work and
+Telegram connection. Database and engine initialization run off the HTTP event
+loop. Unbuffered output and explicit bootstrap/stage logs show where a deployment
+stops. Invalid ports and credentials fail explicitly rather than claiming readiness.
+
+For an **existing manually created Render Web Service**, set these in its dashboard
+(the Blueprint does not automatically change a manually configured service):
+
+- Build command: `pip install -r requirements.txt`
+- Start command: `python -u bot.py`
+- Health check: `/health`
+- Environment: `PYTHON_VERSION=3.11.9`, `PYTHONUNBUFFERED=1`, valid `API_ID`,
+  `API_HASH`, `BOT_TOKEN`. Use Render's supplied `PORT`; fallback is `10000`.
+- Merge the PR into the deployed branch, then **Manual Deploy -> Clear build
+  cache & deploy**. Verify the new commit in Render's deploy view.
+
+Expected order: `NovelBot bootstrap` -> `Starting NovelBot` ->
+`Stage: bind_http` -> `HTTP listening on 0.0.0.0:...` -> `Stage: init_database` ->
+`Stage: build_name_engine` -> `Stage: connect_telegram` -> `Stage: set_commands` ->
+`Stage: ready` / `Telegram and translation engine ready`.
+
+The bot forces line-buffered stdout itself, so these lines appear even if the
+dashboard start command is plain `python bot.py`. While startup is in progress a
+`Still starting: stage=... elapsed=...s` warning is logged every
+`STARTUP_HEARTBEAT_S` seconds (default 20); the same `stage` is exposed in the
+`/health` JSON. If Render still reports "no open ports detected", the log will
+now show exactly which stage stalled (usually `connect_telegram` with invalid
+credentials or a blocked region) instead of silence.
+
+`/ping` returns 200 for HTTP liveness. `/health` and `/ready` intentionally return
+503 until Telegram and the name engine are ready; do not change the health check
+to `/ping` to conceal a broken Telegram connection. If the port warning persists,
+share logs from **bootstrap onward**, without credentials. Local/offline tests do
+not prove that a live Render service or its Telegram credentials work.
+
+### Detailed character report
+
+Each successful novel upload returns the translated file **and** a separate
+`*.character_report.json`. It contains all dictionary-matched character entries
+for that job (not the first 40 entries of the dictionary preview):
+
+| Field | Meaning |
+|---|---|
+| `original_name` / `replacement_name` | Canonical original and chosen Indian name |
+| `mapping_source` | Base dictionary or custom override |
+| `occurrences` | Actual matched occurrences, including unchanged custom targets |
+| `spellings_seen` | Exact matched spellings and their counts |
+| `sample_locations` | Up to five source paragraph/chapter locations |
+| `needs_review` | Unmapped candidate text, counts, sample context and location |
+| `shared_replacement_names` | Different original entries sharing a target name; review for collisions/aliases |
+| `summary` | Actual name/match counts and review-candidate totals |
+
+Spaced, joined, hyphenated, case variants, repeated whitespace and smart
+apostrophes are normalized. `Xiao Yan`, `Xiaoyan`, `XIAO-YAN` now use one target.
+**Compatibility note:** joined spellings previously had their own generated
+name; they now use the spaced canonical name. Use custom mappings to keep a
+previous book's preferred choices. Each job freezes its dictionary snapshot so
+an update during processing cannot change names halfway through a file.
+
+DOCX matching covers split formatting runs, hyperlink text, nested/merged tables
+and standard/first/even headers and footers. Replacement text inherits the first
+text segment's formatting; surrounding text styles and embedded objects remain.
+HTML/XHTML matching covers inline-tag splits and avoids scripts, styles, comments,
+code/pre text and attributes. EPUB links/IDs/binaries are not name-replaced and
+`mimetype` remains first and uncompressed. EPUB expansion is capped at 200 MiB
+and 10,000 members, with no ZIP extraction to disk. TXT/HTML input must be UTF-8;
+invalid bytes fail rather than silently deleting characters.
+
+**No dictionary can guarantee that every character is recognized.** Unknown
+nicknames, new names, alternate romanizations and unlisted languages may be
+missed. The review heuristic looks for a known romanized surname followed by an
+unmapped capitalized token, and Chinese-script text; these may also be places or
+ordinary words. It is not AI entity recognition or a character-biography generator.
+Review detail is capped at 5,000 candidates, with explicit overflow counts. Images,
+DOCX text boxes/footnotes and markup attributes are outside the scan. TXT batching
+is paragraph-based at about 64 KiB; a name split at a batch boundary may need review.
+
+For best coverage, review the report, add each confirmed alias with the **same**
+replacement, then resend the **original file**:
+
+```text
+/addmap Xiao Yan = Arjun Sharma
+/addmap Young Master Xiao = Arjun Sharma
+/addmap Yan-er = Arjun Sharma
+```
+
+Do not auto-map ambiguous short names/surnames without checking the novel. The
+report is not an importable dictionary. Dictionary uploads still use flat JSON
+string pairs and are shared service-wide, not private to each Telegram user.
+
+---
+
 ## Render startup fix: one event loop
 
 The reported error was:
@@ -49,7 +152,7 @@ Do not replace this entrypoint with `asyncio.run(main())`.
 3. Verify `API_ID`, `API_HASH`, and `BOT_TOKEN`. Do not paste them into source
    code or public logs. Set your Telegram user ID as `ADMIN_ID` if needed.
 4. Set build command to `pip install -r requirements.txt`, start command to
-   `python bot.py`, and health-check path to `/health`.
+   `python -u bot.py`, and health-check path to `/health`.
 5. Choose **Manual Deploy -> Clear build cache & deploy**. Confirm the Python
    version in logs, then wait for `Telegram and translation engine ready`.
 6. Check `/health` returns HTTP 200 with `telegram_connected: true`, then send
@@ -104,7 +207,7 @@ not contact Telegram; a successful live deployment must be verified separately.
 
 ### 2. Render par Deploy
 - **Build Command:** `pip install -r requirements.txt`
-- **Start Command:** `python bot.py`
+- **Start Command:** `python -u bot.py`
 - Free tier par **Web Service** chunein (bot ka health-check server
   `$PORT` par chalta hai). Ya `render.yaml` blueprint use karein.
 

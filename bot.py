@@ -7,11 +7,11 @@
   Supported: .txt .md .docx .epub .html .htm  + custom .json mapping
 
   Features:
-    • 25,000+ auto-generated Chinese->Indian name pairs (deterministic)
+    • Deterministic Chinese->Indian name dictionary with spelling aliases
     • Deterministic mapping: same Chinese name => same Indian name har baar
     • Gender-aware Indian names (Male / Female pools alag)
-    • Placeholder-based 2-pass replacement (cascade corruption = 0%)
-    • DOCX formatting preserved (bold/italic/fonts), tables supported
+    • Single-pass replacement with per-file character coverage reports
+    • Cross-run DOCX names, nested tables and headers/footers supported
     • EPUB re-packaging with proper zip structure
     • Custom JSON dictionary (user apna naam-pair bhej sakta hai)
     • SQLite stats + per-user tracking + /broadcast (admin)
@@ -32,9 +32,10 @@ import hashlib
 import logging
 import sqlite3
 import zipfile
-import shutil
 import asyncio
 import platform
+from collections import Counter
+from bisect import bisect_right
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Tuple
 
@@ -51,8 +52,21 @@ try:
 except ImportError:
     pass
 
+# Render/Heroku pipe stdout (not a TTY), so CPython block-buffers it and a stall
+# before the first flush looks like a silent process with no open port. Force
+# line buffering here so stage logs appear even when the dashboard start command
+# is plain "python bot.py" without -u / PYTHONUNBUFFERED.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
+if __name__ == "__main__":
+    print("NovelBot bootstrap: loading dependencies", flush=True)
+
 import docx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from aiohttp import web
 
 from pyrogram import Client, filters, __version__ as PYRO_VERSION
@@ -94,8 +108,12 @@ LOG_FILE     = os.environ.get("LOG_FILE", "bot.log")
 CONNECT_RETRIES = min(10, max(1, _env_int("CONNECT_RETRIES", 5)))
 CONNECT_TIMEOUT_S = max(5, _env_int("CONNECT_TIMEOUT_S", 60))
 SHUTDOWN_TIMEOUT_S = max(5, _env_int("SHUTDOWN_TIMEOUT_S", 15))
+# Heartbeat interval while starting: a stalled stage is reported instead of
+# leaving the platform log silent for minutes (Render's port-scan symptom).
+STARTUP_HEARTBEAT_S = max(5, _env_int("STARTUP_HEARTBEAT_S", 20))
 _started_at = time.monotonic()
 _lifecycle = "starting"
+_startup_stage = "bootstrap"
 _connect_attempt = 0
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -246,199 +264,353 @@ def generate_and_load_mapping():
     global mapping_dict
     mapping_dict.clear()
 
-    chinese_full = (
-        [f"{s} {g}" for s in CH_SURNAMES for g in CH_GIVEN] +   # "Xiao Yan"
-        [f"{s}{g}" for s in CH_SURNAMES for g in CH_GIVEN]      # "Xiaoyan"
-    )
+    # Spaced and joined spellings describe the same character, not two people.
+    for surname in dict.fromkeys(CH_SURNAMES):
+        for given in CH_GIVEN:
+            canonical = f"{surname} {given}"
+            target = _pick_indian_name(canonical)
+            mapping_dict[canonical] = target
+            mapping_dict.setdefault(f"{surname}{given}", target)
 
-    for ch_name in chinese_full:
-        mapping_dict[ch_name] = _pick_indian_name(ch_name)
-
-    logger.info(f"✅ {len(mapping_dict):,} deterministic Chinese->Indian pairs ready.")
+    logger.info("%s deterministic name spellings ready", len(mapping_dict))
     build_regex_engine()
 
 
+def normalize_name(name):
+    name = name.translate(str.maketrans({"İ": "i", "ı": "i", "ſ": "s", "K": "k"}))
+    return re.sub(r"[\s\-‐‑–]+", " ", name.strip()).replace("’", "'").casefold()
+
+
+def _name_pattern(keys):
+    """Factor common prefixes to avoid testing thousands of flat alternatives."""
+    root = {}
+    for key in keys:
+        node = root
+        for char in key:
+            node = node.setdefault(char, {})
+        node[None] = True
+
+    def emit(node):
+        options = []
+        for char, child in node.items():
+            if char is None:
+                continue
+            token = r"[\s\-‐‑–]+" if char == " " else (
+                "['’]" if char == "'" else re.escape(char))
+            options.append(token + emit(child))
+        body = "|".join(options)
+        if len(options) > 1:
+            body = "(?:" + body + ")"
+        if None in node and body:
+            body = "(?:" + body + ")?"
+        return body
+
+    return re.compile(r"(?<!\w)(?:" + emit(root) + r")(?!\w)", re.IGNORECASE) if root else None
+
+
+class NameEngine:
+    """Immutable per-job lookup: dictionary updates cannot change half a book."""
+    def __init__(self, base, custom):
+        self.lookup = {}
+        # Install canonical spaced entries first so joined aliases share their identity.
+        for key in sorted(base, key=lambda k: " " not in k):
+            canonical = normalize_name(key)
+            entry = (key, base[key], "base")
+            self.lookup.setdefault(canonical, entry)
+            self.lookup.setdefault(canonical.replace(" ", ""), entry)
+        aliases = {}
+        for alias in self.lookup:
+            aliases.setdefault(alias.replace(" ", ""), set()).add(alias)
+        for key, value in custom.items():
+            canonical = normalize_name(key)
+            entry = (key, value, "custom")
+            # An override of either spelling also overrides its existing aliases.
+            compact = canonical.replace(" ", "")
+            family = aliases.setdefault(compact, set())
+            family.update((canonical, compact))
+            for alias in family:
+                self.lookup[alias] = entry
+        self.pattern = _name_pattern(self.lookup)
+
+
+_engine = None
+
+
 def build_regex_engine():
-    """
-    Base + Custom dictionaries ko merge karke EK fast Regex engine banata hai.
-    - Lambe naam pehle match hote hain ('Xiaochun' > 'Xiao')
-    - \\b word boundaries se partial-word corruption rukti hai
-    """
-    global compiled_pattern
-    final_dict = {**mapping_dict, **custom_mapping_dict}
-
-    if not final_dict:
-        compiled_pattern = None
-        return
-
-    sorted_keys = sorted(final_dict.keys(), key=len, reverse=True)
-    escaped = [rf"\b{re.escape(k)}\b" for k in sorted_keys]
-    compiled_pattern = re.compile("|".join(escaped), re.IGNORECASE)
-    logger.info(f"🚀 Regex engine ready | {len(final_dict):,} total mappings "
-                f"({len(custom_mapping_dict)} custom).")
+    global compiled_pattern, _engine
+    engine = NameEngine(dict(mapping_dict), dict(custom_mapping_dict))
+    _engine = engine
+    compiled_pattern = engine.pattern
+    logger.info("Name engine ready | %s spellings (%s custom entries)",
+                len(engine.lookup), len(custom_mapping_dict))
 
 
-# =====================================================================
-# 5. 2-PASS PLACEHOLDER REPLACEMENT  (cascade corruption = 0)
-# =====================================================================
-#
-#  Problem: Agar 'Xiao' -> 'Arjun' ho aur 'Arjun' string mein phir koi
-#  match ho jaye to text corrupt hota hai.
-#  Solution: Pass-1 mein matches ko \x00ID\x00 placeholder se badlo,
-#  Pass-2 mein placeholder -> final Indian name. Kabhi double-replace nahi.
+# Review candidates are deliberately NOT auto-replaced: a surname or capitalized
+# phrase can be a place/common word. This is a review aid, not entity recognition.
+_REVIEW_PATTERN = re.compile(
+    r"(?<!\w)(?:" + "|".join(sorted(set(CH_SURNAMES), key=len, reverse=True)) +
+    r")[ \t-]+[A-Z][a-z]+(?:['’][a-z]+)?(?!\w)|[\u3400-\u9fff]{2,8}"
+)
 
-_PLACEHOLDER = "\x00{:06d}\x00"
+
+class TranslationSession:
+    """One file's engine snapshot, actual replacement counts, and review evidence."""
+    def __init__(self, engine=None):
+        self.engine = engine or _engine
+        self.names = {}
+        self.review = {}
+        self.replacements = 0
+        self.review_mentions = 0
+        self.omitted_review_mentions = 0
+
+    def edits(self, text, location="text"):
+        edits = []
+        if self.engine and self.engine.pattern:
+            for match in self.engine.pattern.finditer(text):
+                original, target, source = self.engine.lookup[normalize_name(match.group())]
+                entry = self.names.setdefault(original, {
+                    "original_name": original, "replacement_name": target,
+                    "mapping_source": source, "occurrences": 0,
+                    "spellings_seen": Counter(), "sample_locations": [],
+                })
+                entry["occurrences"] += 1
+                entry["spellings_seen"][match.group()] += 1
+                if location not in entry["sample_locations"] and len(entry["sample_locations"]) < 5:
+                    entry["sample_locations"].append(location)
+                self.replacements += 1
+                edits.append((match.start(), match.end(), target))
+        # Mask replaced spans before looking for unknown candidates in original text.
+        parts, cursor = [], 0
+        for start, end, _ in edits:
+            parts.extend((text[cursor:start], " " * (end - start)))
+            cursor = end
+        parts.append(text[cursor:])
+        for match in _REVIEW_PATTERN.finditer("".join(parts)):
+            self.review_mentions += 1
+            key = match.group()
+            if key not in self.review and len(self.review) >= 5000:
+                self.omitted_review_mentions += 1
+                continue
+            entry = self.review.setdefault(key, {
+                "possible_name": key, "occurrences": 0, "samples": [],
+                "reason": "Not in dictionary; verify person/place and add an explicit mapping",
+            })
+            entry["occurrences"] += 1
+            if len(entry["samples"]) < 3:
+                entry["samples"].append({"location": location,
+                    "context": text[max(0, match.start()-60):match.end()+60]})
+        return edits
+
+    def __call__(self, text, location="text"):
+        pieces, cursor = [], 0
+        for start, end, replacement in self.edits(text, location):
+            pieces.extend((text[cursor:start], replacement))
+            cursor = end
+        pieces.append(text[cursor:])
+        return "".join(pieces)
+
+    def report(self):
+        targets = {}
+        for name, entry in self.names.items():
+            targets.setdefault(entry["replacement_name"], []).append(name)
+        collisions = [{"replacement_name": target, "original_names": names}
+                      for target, names in targets.items() if len(names) > 1]
+        return {
+            "report_version": 1,
+            "summary": {"unique_names_replaced": len(self.names),
+                        "total_replacements": self.replacements,
+                        "review_candidate_mentions": self.review_mentions,
+                        "omitted_review_mentions": self.omitted_review_mentions},
+            "characters": sorted(self.names.values(), key=lambda e: e["original_name"].casefold()),
+            "needs_review": sorted(self.review.values(), key=lambda e: e["possible_name"]),
+            "shared_replacement_names": collisions,
+            "notes": [
+                "Dictionary-based replacement, not guaranteed complete character recognition.",
+                "Unknown names, nicknames, alternate romanizations and unlisted scripts can be missed.",
+                "Review candidates may be places/common words; they are not automatically changed.",
+                "Add each confirmed alias using /addmap Alias = Same Indian Name and resend the original file.",
+                "Shared replacement names may be aliases or different people; review and override if needed.",
+                "Names/gender are generated heuristically, not verified character biographies.",
+                "Counts cover processed text only; images, DOCX text boxes/footnotes and markup attributes are not scanned.",
+                "TXT is processed in paragraph batches of about 64 KiB; names spanning a batch boundary may need review.",
+                "Review details are capped at 5000 candidates; omitted_review_mentions explicitly reports overflow.",
+            ],
+        }
 
 
 def translate_text(text: str) -> str:
-    if not compiled_pattern or not text:
-        return text
+    return TranslationSession()(text) if text else text
 
-    final_dict = {**mapping_dict, **custom_mapping_dict}
-    found: Dict[str, str] = {}
-    counter = [0]
 
-    def _stash(m: re.Match) -> str:
-        key = m.group(0)
-        # custom mapping priority, phir base mapping (case-insensitive lookup)
-        repl = custom_mapping_dict.get(key) or mapping_dict.get(key)
-        if repl is None:
-            for k, v in custom_mapping_dict.items():
-                if k.lower() == key.lower():
-                    repl = v
-                    break
-        if repl is None:
-            for k, v in mapping_dict.items():
-                if k.lower() == key.lower():
-                    repl = v
-                    break
-        if repl is None:
-            return key
-        token = _PLACEHOLDER.format(counter[0])
-        found[token] = repl
-        counter[0] += 1
-        return token
-
-    text = compiled_pattern.sub(_stash, text)
-    for token, repl in found.items():
-        text = text.replace(token, repl)
-    return text
+def _translate_segments(segments, translate, location):
+    """Match across runs/tags; inserted name inherits the first segment's style."""
+    text = "".join(segments)
+    starts, offset = [], 0
+    for part in segments:
+        starts.append(offset)
+        offset += len(part)
+    result = list(segments)
+    for start, end, replacement in reversed(translate.edits(text, location)):
+        first = bisect_right(starts, start) - 1
+        last = bisect_right(starts, end - 1) - 1
+        left, right = start - starts[first], end - starts[last]
+        if first == last:
+            result[first] = result[first][:left] + replacement + result[first][right:]
+        else:
+            result[first] = result[first][:left] + replacement
+            for index in range(first + 1, last):
+                result[index] = ""
+            result[last] = result[last][right:]
+    return result
 
 
 # =====================================================================
-# 6. FILE PROCESSORS  (TXT / DOCX / HTML / EPUB)
+# 6. FILE PROCESSORS
 # =====================================================================
 
-def process_txt(old_path: str, new_path: str):
-    """Line-by-line streaming — badi files par bhi kam memory."""
-    with open(old_path, "r", encoding="utf-8", errors="replace") as fin, \
+def process_txt(old_path, new_path, translate=None):
+    translate = translate or TranslationSession()
+    with open(old_path, "r", encoding="utf-8-sig", errors="strict") as fin, \
          open(new_path, "w", encoding="utf-8") as fout:
-        for line in fin:
-            fout.write(translate_text(line))
+        lines, size, first_line = [], 0, 1
+        for number, line in enumerate(fin, 1):
+            lines.append(line)
+            size += len(line)
+            # Paragraphs allow names wrapped across lines. Bound working memory.
+            if not line.strip() or size >= 65536:
+                fout.write(translate("".join(lines), f"lines {first_line}-{number}"))
+                lines, size, first_line = [], 0, number + 1
+        if lines:
+            fout.write(translate("".join(lines), f"from line {first_line}"))
 
 
-def process_docx(old_path: str, new_path: str):
-    """
-    DOCX mein formatting (bold/italic/font/size) 'runs' mein hoti hai.
-    Run-by-run replace karte hain => formatting 100% preserved. ✅
-    """
-    doc = docx.Document(old_path)
+def process_docx(old_path, new_path, translate=None):
+    translate = translate or TranslationSession()
+    document = docx.Document(old_path)
+    seen = set()
 
-    def _replace_in_paragraph(p):
-        for run in p.runs:
-            if run.text:
-                run.text = translate_text(run.text)
+    def walk(container, location):
+        for index, paragraph in enumerate(container.paragraphs, 1):
+            if paragraph._p in seen:
+                continue
+            seen.add(paragraph._p)
+            # Edit only text leaves, never run.text (which deletes drawings/fields).
+            # Non-text children are barriers; do not match across drawings or fields.
+            leaves, segments = [], []
+            for run in paragraph._p.xpath(".//w:r"):
+                if run.xpath("ancestor::w:p[1]")[0] is not paragraph._p:
+                    continue  # text boxes are a separate, unsupported story
+                for node in run:
+                    if node.tag == docx.oxml.ns.qn("w:rPr"):
+                        continue
+                    is_text = node.tag == docx.oxml.ns.qn("w:t")
+                    leaves.append(node if is_text else None)
+                    segments.append((node.text or "") if is_text else "\x00")
+            replaced = _translate_segments(segments, translate, f"{location}/paragraph {index}")
+            for node, original, changed in zip(leaves, segments, replaced):
+                if node is not None and original != changed:
+                    node.text = changed
+                    node.set(docx.oxml.ns.qn("xml:space"), "preserve")
+        for index, table in enumerate(container.tables, 1):
+            for row_index, row in enumerate(table.rows, 1):
+                for cell_index, cell in enumerate(row.cells, 1):
+                    walk(cell, f"{location}/table {index}/row {row_index}/cell {cell_index}")
 
-    for p in doc.paragraphs:
-        _replace_in_paragraph(p)
-
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    _replace_in_paragraph(p)
-
-    # Header / Footer bhi cover karo
-    for section in doc.sections:
-        for p in section.header.paragraphs:
-            _replace_in_paragraph(p)
-        for p in section.footer.paragraphs:
-            _replace_in_paragraph(p)
-
-    doc.save(new_path)
-
-
-def process_html(old_path: str, new_path: str):
-    """Sirf visible text nodes translate hote hain; <script>/<style> safe rehte hain."""
-    with open(old_path, "r", encoding="utf-8", errors="ignore") as f:
-        soup = BeautifulSoup(f, "html.parser")
-
-    skip = {"style", "script", "head", "title", "meta", "[document]", "code", "pre"}
-    for node in soup.find_all(string=True):
-        if node.parent and node.parent.name not in skip:
-            node.replace_with(translate_text(str(node)))
-
-    with open(new_path, "w", encoding="utf-8") as f:
-        f.write(str(soup))
+    walk(document, "document")
+    for index, section in enumerate(document.sections, 1):
+        for name in ("header", "footer", "first_page_header", "first_page_footer",
+                     "even_page_header", "even_page_footer"):
+            part = getattr(section, name)
+            if not part.is_linked_to_previous:
+                walk(part, f"section {index}/{name}")
+    document.save(new_path)
 
 
-def process_epub(old_path: str, new_path: str):
-    """
-    EPUB = zip of XHTML files. Unzip -> translate -> rezip.
-    mimetype file ko pehle & uncompressed rakhna zaroori hai (EPUB spec).
-    """
-    temp_dir = old_path + "_unzipped"
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
+def translate_markup(content, translate, location, xml=False):
+    soup = BeautifulSoup(content, "xml" if xml else "html.parser")
+    excluded = {"script", "style", "code", "pre"}
+    blocks = {"p", "div", "section", "article", "li", "td", "th", "h1", "h2", "h3",
+              "h4", "h5", "h6", "title", "text", "creator", "description", "body"}
+    nodes, block = [], None
+    group_number = 0
 
-    with zipfile.ZipFile(old_path, "r") as z:
-        z.extractall(temp_dir)
+    def flush():
+        nonlocal nodes, group_number
+        if nodes:
+            group_number += 1
+            values = _translate_segments([str(n) for n in nodes], translate,
+                                         f"{location}/text group {group_number}")
+            for node, value in zip(nodes, values):
+                if str(node) != value:
+                    node.replace_with(value)
+            nodes = []
 
-    for root, _dirs, files in os.walk(temp_dir):
-        for fn in files:
-            if fn.lower().endswith((".html", ".xhtml", ".htm", ".xml", ".opf", ".ncx")):
-                fp = os.path.join(root, fn)
-                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-                content = translate_text(content)
-                with open(fp, "w", encoding="utf-8") as f:
-                    f.write(content)
-
-    with zipfile.ZipFile(new_path, "w") as zout:
-        # mimetype must be FIRST & STORED (EPUB standard)
-        mt = os.path.join(temp_dir, "mimetype")
-        if os.path.exists(mt):
-            zout.write(mt, "mimetype", compress_type=zipfile.ZIP_STORED)
-        for root, _dirs, files in os.walk(temp_dir):
-            for fn in files:
-                fp = os.path.join(root, fn)
-                arc = os.path.relpath(fp, temp_dir)
-                if arc == "mimetype":
-                    continue
-                zout.write(fp, arc, compress_type=zipfile.ZIP_DEFLATED)
-
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    # Materialize traversal because replacing text mutates the soup.
+    for node in list(soup.descendants):
+        if isinstance(node, Tag):
+            if node.name in blocks or node.name in excluded or node.name in {"br", "hr"}:
+                flush()
+                block = None
+            continue
+        if not isinstance(node, NavigableString) or isinstance(node, Comment):
+            continue
+        ancestors = list(node.parents)
+        if any(parent.name in excluded for parent in ancestors):
+            flush()
+            continue
+        owner = next((parent for parent in ancestors if parent.name in blocks), node.parent)
+        if owner is not block:
+            flush()
+            block = owner
+        nodes.append(node)
+    flush()
+    return str(soup)
 
 
-def process_file(old_path: str, new_path: str) -> bool:
-    """Extension ke hisaab se sahi processor chalata hai."""
+def process_html(old_path, new_path, translate=None):
+    translate = translate or TranslationSession()
+    with open(old_path, "r", encoding="utf-8-sig", errors="strict") as stream:
+        result = translate_markup(stream.read(), translate, os.path.basename(old_path))
+    with open(new_path, "w", encoding="utf-8") as stream:
+        stream.write(result)
+
+
+def process_epub(old_path, new_path, translate=None):
+    translate = translate or TranslationSession()
+    # Never extract user ZIP paths to disk. Limit expansion before reading members.
+    with zipfile.ZipFile(old_path) as source, zipfile.ZipFile(new_path, "w") as target:
+        infos = source.infolist()
+        if len(infos) > 10000 or sum(info.file_size for info in infos) > 200 * 1024 * 1024:
+            raise ValueError("EPUB expands beyond the safe processing limit")
+        if len({info.filename for info in infos}) != len(infos):
+            raise ValueError("EPUB contains duplicate member names")
+        for info in sorted(infos, key=lambda entry: entry.filename != "mimetype"):
+            data = source.read(info)
+            ext = os.path.splitext(info.filename)[1].lower()
+            if ext in {".html", ".htm", ".xhtml", ".opf", ".ncx"}:
+                data = translate_markup(data, translate, info.filename,
+                                        xml=ext in {".xhtml", ".opf", ".ncx"}).encode("utf-8")
+            compression = zipfile.ZIP_STORED if info.filename == "mimetype" else zipfile.ZIP_DEFLATED
+            target.writestr(info, data, compress_type=compression)
+
+
+def process_file(old_path: str, new_path: str, report_path=None) -> bool:
     if not compiled_pattern:
         return False
-    ext = os.path.splitext(old_path)[1].lower()
+    processors = {".txt": process_txt, ".md": process_txt, ".docx": process_docx,
+                  ".html": process_html, ".htm": process_html, ".epub": process_epub}
+    processor = processors.get(os.path.splitext(old_path)[1].lower())
+    if processor is None:
+        return False
     try:
-        if ext in (".txt", ".md"):
-            process_txt(old_path, new_path)
-        elif ext == ".docx":
-            process_docx(old_path, new_path)
-        elif ext in (".html", ".htm"):
-            process_html(old_path, new_path)
-        elif ext == ".epub":
-            process_epub(old_path, new_path)
-        else:
-            return False
+        session = TranslationSession()
+        processor(old_path, new_path, session)
+        if report_path:
+            with open(report_path, "w", encoding="utf-8") as stream:
+                json.dump(session.report(), stream, ensure_ascii=False, indent=2)
         return True
-    except Exception as e:
-        logger.error(f"❌ Processing error ({ext}): {e}", exc_info=True)
+    except Exception:
+        logger.exception("File processing failed")
         return False
 
 
@@ -548,6 +720,11 @@ HELP_TEXT = (
     "🗺️ **Custom Dictionary (2 tareeke):**\n"
     "• `.json` file bhejein:\n`{\"Xiao Yan\": \"Arjun Sharma\"}`\n"
     "• Ya command: `/addmap Xiao Yan = Arjun Sharma`\n\n"
+    "**Name coverage report:** Har output ke saath character_report.json milega.\n"
+    "Original/naya naam, actual count, spellings aur sample locations dekhein.\n"
+    "needs_review mein possible unknown names honge; yeh guaranteed complete list nahi hai.\n"
+    "Nicknames/aliases ko same Indian naam par map karein aur original file dobara bhejein.\n"
+    "Dictionary is bot ke sab users ke liye shared hai.\n\n"
     "📋 **Commands:**\n"
     "/start — Bot shuru karein\n"
     "/help — Yeh madad\n"
@@ -628,7 +805,7 @@ async def engine_cmd(client: Client, message: Message):
         f"🇮🇳 Indian First Names: `{len(IN_MALE_FIRST) + len(IN_FEMALE_FIRST)}` "
         f"(M:{len(IN_MALE_FIRST)} / F:{len(IN_FEMALE_FIRST)})\n"
         f"🇮🇳 Indian Surnames: `{len(IN_LAST)}`\n\n"
-        "⚙️ Engine: Deterministic MD5 mapping + 2-pass placeholder replacement\n"
+        "Engine: deterministic mapping, spelling aliases, single-pass replacement\n"
         "✅ Same Chinese naam hamesha same Indian naam banega!",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -659,15 +836,15 @@ async def addmap_cmd(client: Client, message: Message):
     try:
         payload = message.text.split(None, 1)[1]
         chinese, indian = [x.strip() for x in payload.split("=", 1)]
-        if not chinese or not indian:
+        if not chinese or not indian or len(chinese) > 200 or len(indian) > 200:
             raise ValueError
     except (IndexError, ValueError):
         return await message.reply(
             "⚠️ Format galat hai.\n\nSahi format:\n`/addmap Xiao Yan = Arjun Sharma`",
             parse_mode=ParseMode.MARKDOWN
         )
-    custom_mapping_dict[chinese] = indian
     save_custom_map(chinese, indian)
+    custom_mapping_dict[chinese] = indian
     build_regex_engine()
     await message.reply(
         f"✅ **Mapping add ho gayi!**\n\n`{chinese}` → **{indian}**\n\n"
@@ -767,7 +944,7 @@ async def callback_handler(client: Client, cq: CallbackQuery):
     elif data == "engine_info":
         await cq.message.edit_text(
             f"🧠 **Engine:** `{len(mapping_dict) + len(custom_mapping_dict):,}` mappings | "
-            "Deterministic | 2-pass safe replacement",
+            "Deterministic | spelling aliases | character reports",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("◀️ Back", callback_data="main_menu")]]),
             parse_mode=ParseMode.MARKDOWN
@@ -896,6 +1073,7 @@ async def handle_document(client: Client, message: Message):
     safe_name = re.sub(r"[^\w.\-]", "_", doc.file_name or "novel")
     old_path = os.path.join(DOWNLOAD_DIR, f"{chat_id}_{message.id}_in_{safe_name}")
     new_path = os.path.join(DOWNLOAD_DIR, f"{chat_id}_{message.id}_out_{safe_name}")
+    report_path = new_path + ".character_report.json"
 
     status = await message.reply("⏳ **Step 1/3:** File download ho rahi hai...",
                                  quote=True, parse_mode=ParseMode.MARKDOWN)
@@ -915,7 +1093,7 @@ async def handle_document(client: Client, message: Message):
         )
 
         # CPU-heavy kaam background thread mein (bot block nahi hoga)
-        success = await asyncio.to_thread(process_file, old_path, new_path)
+        success = await asyncio.to_thread(process_file, old_path, new_path, report_path)
 
         if not success:
             return await status.edit_text(
@@ -926,6 +1104,8 @@ async def handle_document(client: Client, message: Message):
         await status.edit_text("📤 **Step 3/3:** Nayi file upload ho rahi hai...",
                                parse_mode=ParseMode.MARKDOWN)
 
+        with open(report_path, "r", encoding="utf-8") as stream:
+            summary = json.load(stream)["summary"]
         elapsed = time.time() - t0
         out_size = os.path.getsize(new_path) / 1024 / 1024
         caption = (
@@ -934,7 +1114,10 @@ async def handle_document(client: Client, message: Message):
             f"📦 **Size:** `{out_size:.2f} MB`\n"
             f"⏱️ **Time:** `{elapsed:.1f} sec`\n"
             f"🧠 **Engine:** `{len(mapping_dict) + len(custom_mapping_dict):,}` mappings "
-            f"(2-pass safe mode)"
+            f"(single-pass safe mode)\n"
+            f"Unique names: {summary['unique_names_replaced']} | Replacements: {summary['total_replacements']}\n"
+            f"Review candidate mentions: {summary['review_candidate_mentions']}\n"
+            "Detailed report follows; unknown names may still need custom mappings."
         )
 
         await message.reply_document(
@@ -947,6 +1130,18 @@ async def handle_document(client: Client, message: Message):
         )
         add_user(user_id, message.from_user.username, message.from_user.first_name)
         increment_user_stats(user_id)
+        try:
+            await message.reply_document(
+                report_path,
+                caption="Character report: names, counts, spellings, locations and candidates to review. "
+                        "This is a report, not an importable mapping dictionary.",
+                parse_mode=ParseMode.DISABLED,
+            )
+        except Exception:
+            logger.exception("Translated file sent, but character report upload failed")
+            await status.edit_text("Translated file bhej di gayi, lekin report upload fail hua. "
+                                   "Report ke liye original file dobara bhejein.")
+            return
         await status.delete()
 
     except FloodWait as e:
@@ -956,7 +1151,7 @@ async def handle_document(client: Client, message: Message):
         await status.edit_text("❌ Technical kharabi aa gayi. Thodi der baad koshish karein.",
                                parse_mode=ParseMode.MARKDOWN)
     finally:
-        for p in (old_path, new_path):
+        for p in (old_path, new_path, report_path):
             if os.path.exists(p):
                 try:
                     os.remove(p)
@@ -985,6 +1180,7 @@ async def web_handler(request):
         "status": "ready" if ready else (
             "degraded" if _lifecycle == "ready" else _lifecycle
         ),
+        "stage": _startup_stage,
         "bot": "Advanced Novel Translator",
         "mappings": len(mapping_dict) + len(custom_mapping_dict),
         "engine_ready": compiled_pattern is not None,
@@ -999,7 +1195,11 @@ async def ping_handler(request):
 
 
 async def start_web_server() -> web.AppRunner:
-    port = _env_int("PORT", 8080)
+    raw_port = os.environ.get("PORT", "10000").strip()
+    try:
+        port = int(raw_port)
+    except ValueError as error:
+        raise ValueError("PORT must be an integer between 1 and 65535") from error
     if not 1 <= port <= 65535:
         raise ValueError("PORT must be between 1 and 65535")
     web_app = web.Application()
@@ -1015,7 +1215,7 @@ async def start_web_server() -> web.AppRunner:
     except BaseException:
         await runner.cleanup()
         raise
-    logger.info(f"🌐 Web server live on port {port} (/health endpoint ready)")
+    logger.info("HTTP listening on 0.0.0.0:%s; /ping live, /health returns 503 until bot ready", port)
     return runner
 
 
@@ -1109,6 +1309,25 @@ async def _start_telegram():
             await asyncio.sleep(delay)
 
 
+def _set_stage(stage: str):
+    """Record and log the current startup stage for heartbeat/health output."""
+    global _startup_stage
+    _startup_stage = stage
+    logger.info("Stage: %s (t+%ds)", stage, int(time.monotonic() - _started_at))
+
+
+async def _startup_heartbeat():
+    """Log periodically until startup finishes so a hung stage is visible."""
+    try:
+        while True:
+            await asyncio.sleep(STARTUP_HEARTBEAT_S)
+            logger.warning("Still starting: stage=%s connect_attempt=%s elapsed=%ds",
+                           _startup_stage, _connect_attempt,
+                           int(time.monotonic() - _started_at))
+    except asyncio.CancelledError:
+        pass
+
+
 async def main():
     global _lifecycle
     _validate_config()
@@ -1120,6 +1339,7 @@ async def main():
     stop_event = asyncio.Event()
     installed_signals = []
     web_runner = None
+    heartbeat = None
     _lifecycle = "starting"
 
     def request_stop():
@@ -1139,19 +1359,30 @@ async def main():
     try:
         logger.info("Starting NovelBot | Python %s | Kurigram %s | single event loop",
                     platform.python_version(), PYRO_VERSION)
-        init_db()
-        load_custom_maps()
-        generate_and_load_mapping()
+        heartbeat = asyncio.create_task(_startup_heartbeat())
+        # Bind before database/engine work or Telegram I/O so Render sees the port.
+        _set_stage("bind_http")
         web_runner = await start_web_server()
+        _set_stage("init_database")
+        await asyncio.to_thread(init_db)
+        await asyncio.to_thread(load_custom_maps)
+        _set_stage("build_name_engine")
+        await asyncio.to_thread(generate_and_load_mapping)
+        _set_stage("connect_telegram")
+        logger.info("Connecting Telegram (timeout %ss per attempt)", CONNECT_TIMEOUT_S)
         await _start_telegram()
         # start() already retrieves the bot identity; avoid an extra API call.
         logger.info("Bot online: @%s (id: %s)", app.me.username, app.me.id)
+        _set_stage("set_commands")
         try:
             async with asyncio.timeout(15):
                 await _set_bot_commands()
         except (TimeoutError, OSError):
             logger.warning("Command menu setup unavailable; bot will still serve messages")
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
         _lifecycle = "ready"
+        _set_stage("ready")
         logger.info("Telegram and translation engine ready")
         await stop_event.wait()
     except asyncio.CancelledError:
@@ -1162,6 +1393,9 @@ async def main():
         raise
     finally:
         _lifecycle = "stopping"
+        if heartbeat is not None:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
         try:
             await _close_telegram()
         except Exception:

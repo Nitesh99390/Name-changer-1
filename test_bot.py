@@ -7,6 +7,9 @@ import signal
 import subprocess
 import sys
 import unittest
+import tempfile
+import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -281,6 +284,348 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         message.download.assert_not_awaited()
         message.reply.assert_awaited_once()
 
+
+
+class NameCoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = bot.NameEngine(
+            {"Xiao Yan": "Arjun Sharma", "XiaoYan": "Old Alias Name", "Lin Feng": "Kabir Singh"}, {})
+
+    def session(self, custom=None):
+        return bot.TranslationSession(bot.NameEngine(
+            {"Xiao Yan": "Arjun Sharma", "Lin Feng": "Kabir Singh"}, custom or {}))
+
+    def test_all_common_spellings_have_same_identity(self):
+        session = bot.TranslationSession(self.engine)
+        text = "Xiao Yan|Xiaoyan|XIAO YAN|Xiao-Yan|Xiao\tYan|Xiao\nYan|Xiao\u00a0Yan|Xiao‑Yan"
+        self.assertEqual(session(text), "|".join(["Arjun Sharma"] * 8))
+        report = session.report()
+        self.assertEqual(report["summary"]["unique_names_replaced"], 1)
+        self.assertEqual(report["summary"]["total_replacements"], 8)
+        self.assertEqual(len(report["characters"][0]["spellings_seen"]), 8)
+
+    def test_generated_aliases_keep_canonical_mapping(self):
+        with patch.multiple(bot, mapping_dict={}, custom_mapping_dict={}, _engine=None, compiled_pattern=None):
+            bot.generate_and_load_mapping()
+            self.assertEqual(bot.mapping_dict["XiaoYan"], bot.mapping_dict["Xiao Yan"])
+            session = bot.TranslationSession()
+            self.assertEqual(session("XiaoYan"), session("Xiao Yan"))
+
+    def test_custom_override_case_and_joined_alias_priority(self):
+        for custom_key in ("xiao yan", "XIAOYAN", "Xiao-Yan"):
+            with self.subTest(custom_key=custom_key):
+                session = self.session({custom_key: "Rudra Rao"})
+                self.assertEqual(session("Xiao Yan xiaoyan XIAO-YAN"), "Rudra Rao Rudra Rao Rudra Rao")
+                self.assertEqual(session.report()["characters"][0]["mapping_source"], "custom")
+
+    def test_multiword_alias_longest_match_and_possessive(self):
+        session = self.session({"Xiao Yan Qing": "Meera Rao", "Young Master Xiao": "Arjun Sharma"})
+        self.assertEqual(session("Xiao Yan Qing met Young Master Xiao's friend."),
+                         "Meera Rao met Arjun Sharma's friend.")
+
+    def test_smart_apostrophe_and_unicode_case(self):
+        session = self.session({"Lin Wan'er": "Meera Rao"})
+        self.assertEqual(session("Lin Wan’er"), "Meera Rao")
+        self.assertEqual(session("LİN FENG"), "Kabir Singh")
+
+    def test_partial_words_are_not_changed(self):
+        session = self.session()
+        text = "AXiao Yan Xiao Yanming _XiaoYan XiaoYan_"
+        self.assertEqual(session(text), text)
+        self.assertEqual(session.replacements, 0)
+
+    def test_single_pass_does_not_cascade_or_consume_null_tokens(self):
+        session = self.session({"Xiao Yan": "Lin Feng"})
+        self.assertEqual(session("Xiao Yan Lin Feng \x00000000\x00"),
+                         "Lin Feng Kabir Singh \x00000000\x00")
+
+    def test_sessions_snapshot_dictionary_and_isolate_counts(self):
+        custom = {"Xiao Yan": "Rudra Rao"}
+        engine = bot.NameEngine({}, custom)
+        old_session = bot.TranslationSession(engine)
+        custom["Xiao Yan"] = "Meera Rao"
+        new_session = bot.TranslationSession(bot.NameEngine({}, custom))
+        self.assertEqual(old_session("Xiao Yan"), "Rudra Rao")
+        self.assertEqual(new_session("Xiao Yan Xiao Yan"), "Meera Rao Meera Rao")
+        self.assertEqual(old_session.replacements, 1)
+        self.assertEqual(new_session.replacements, 2)
+
+    def test_unknown_review_has_context_not_automatic_replacement(self):
+        session = self.session()
+        self.assertEqual(session("Xiao Zoravan met 萧炎 and Xiao Yan.", "chapter 2"),
+                         "Xiao Zoravan met 萧炎 and Arjun Sharma.")
+        report = session.report()
+        self.assertEqual({e["possible_name"] for e in report["needs_review"]}, {"Xiao Zoravan", "萧炎"})
+        self.assertEqual(report["needs_review"][0]["samples"][0]["location"], "chapter 2")
+        self.assertEqual(report["characters"][0]["sample_locations"], ["chapter 2"])
+        json.dumps(report)
+
+    def test_no_matches_report_does_not_claim_complete_detection(self):
+        session = self.session()
+        self.assertEqual(session("Alice waited."), "Alice waited.")
+        report = session.report()
+        self.assertEqual(report["summary"]["total_replacements"], 0)
+        self.assertIn("not guaranteed", " ".join(report["notes"]))
+
+    def test_colliding_generated_names_are_flagged_for_review(self):
+        session = self.session({"Lin Feng": "Arjun Sharma"})
+        session("Xiao Yan met Lin Feng.")
+        self.assertEqual(session.report()["shared_replacement_names"], [{
+            "replacement_name": "Arjun Sharma", "original_names": ["Xiao Yan", "Lin Feng"]}])
+
+    def test_empty_engine_and_empty_segments(self):
+        session = bot.TranslationSession(bot.NameEngine({}, {}))
+        self.assertEqual(session("Hello"), "Hello")
+        self.assertEqual(bot._translate_segments([], session, "empty"), [])
+
+    def test_cross_segment_multiple_replacements_and_empty_run(self):
+        session = self.session()
+        segments = ["Hello Xiao ", "", "Yan and Lin ", "Feng!"]
+        result = bot._translate_segments(segments, session, "paragraph 1")
+        self.assertEqual("".join(result), "Hello Arjun Sharma and Kabir Singh!")
+        self.assertEqual(session.replacements, 2)
+
+
+class FileCoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.engine = bot.NameEngine({"Xiao Yan": "Arjun Sharma", "Lin Feng": "Kabir Singh"}, {})
+        patches = patch.multiple(bot, _engine=self.engine, compiled_pattern=self.engine.pattern)
+        patches.start()
+        self.addCleanup(patches.stop)
+
+    def paths(self, extension):
+        return self.directory / ("input" + extension), self.directory / ("output" + extension)
+
+    def test_txt_report_utf8_bom_multiline_and_counts(self):
+        source, target = self.paths(".txt")
+        source.write_text("Xiao\nYan met Xiaoyan.\n\nXiao Zoravan waited.", encoding="utf-8-sig")
+        report = self.directory / "character_report.json"
+        self.assertTrue(bot.process_file(str(source), str(target), str(report)))
+        self.assertEqual(target.read_text(), "Arjun Sharma met Arjun Sharma.\n\nXiao Zoravan waited.")
+        data = json.loads(report.read_text())
+        self.assertEqual(data["summary"]["total_replacements"], 2)
+        self.assertEqual(data["summary"]["review_candidate_mentions"], 1)
+
+    def test_invalid_utf8_and_unsupported_file_fail_explicitly(self):
+        source, target = self.paths(".txt")
+        source.write_bytes(b"Xiao Yan\xff")
+        with self.assertLogs("NovelBot", level="ERROR"):
+            self.assertFalse(bot.process_file(str(source), str(target)))
+        self.assertFalse(bot.process_file("input.pdf", str(target)))
+
+    def test_docx_split_runs_nested_tables_and_header_footer(self):
+        source, target = self.paths(".docx")
+        document = bot.docx.Document()
+        paragraph = document.add_paragraph()
+        paragraph.add_run("Hello Xiao ").bold = True
+        paragraph.add_run("Yan!").italic = True
+        cell = document.add_table(rows=1, cols=1).cell(0, 0)
+        cell.add_table(rows=1, cols=1).cell(0, 0).text = "Lin Feng"
+        document.sections[0].header.paragraphs[0].text = "Xiao Yan"
+        document.sections[0].footer.add_table(rows=1, cols=1, width=1000).cell(0, 0).text = "Lin Feng"
+        document.save(source)
+        session = bot.TranslationSession(self.engine)
+        bot.process_docx(source, target, session)
+        result = bot.docx.Document(target)
+        paragraph = result.paragraphs[0]
+        self.assertEqual(paragraph.text, "Hello Arjun Sharma!")
+        self.assertTrue(paragraph.runs[0].bold)
+        self.assertTrue(paragraph.runs[1].italic)
+        self.assertEqual(result.tables[0].cell(0, 0).tables[0].cell(0, 0).text, "Kabir Singh")
+        self.assertEqual(result.sections[0].header.paragraphs[0].text, "Arjun Sharma")
+        self.assertEqual(result.sections[0].footer.tables[0].cell(0, 0).text, "Kabir Singh")
+        self.assertEqual(session.replacements, 4)
+
+    def test_docx_drawings_and_fields_are_not_deleted(self):
+        source, target = self.paths(".docx")
+        document = bot.docx.Document()
+        run = document.add_paragraph().add_run("Xiao Yan")
+        for tag in ("w:drawing", "w:fldChar"):
+            run._r.append(bot.docx.oxml.OxmlElement(tag))
+        document.save(source)
+        bot.process_docx(source, target)
+        result = bot.docx.Document(target)
+        self.assertEqual(result.paragraphs[0].text, "Arjun Sharma")
+        self.assertEqual(len(result.paragraphs[0]._p.xpath(".//w:drawing")), 1)
+        self.assertEqual(len(result.paragraphs[0]._p.xpath(".//w:fldChar")), 1)
+
+    def test_docx_merged_cells_and_linked_headers_count_once(self):
+        source, target = self.paths(".docx")
+        document = bot.docx.Document()
+        table = document.add_table(rows=1, cols=2)
+        table.cell(0, 0).merge(table.cell(0, 1)).text = "Xiao Yan"
+        document.sections[0].header.paragraphs[0].text = "Xiao Yan"
+        document.add_section()
+        document.save(source)
+        session = bot.TranslationSession(self.engine)
+        bot.process_docx(source, target, session)
+        self.assertEqual(session.replacements, 2)
+
+    def test_html_inline_names_preserve_attributes_scripts_and_comments(self):
+        content = '<p id="Xiao Yan">Xiao <b>Yan</b> met Lin Feng.</p><script>Xiao Yan</script>' \
+                  '<pre><span>Xiao Yan</span></pre><!-- Xiao Yan --><a href="Xiao Yan.html">link</a>'
+        session = bot.TranslationSession(self.engine)
+        result = bot.BeautifulSoup(bot.translate_markup(content, session, "chapter"), "html.parser")
+        self.assertEqual(result.p.get_text(), "Arjun Sharma met Kabir Singh.")
+        self.assertEqual(result.p["id"], "Xiao Yan")
+        self.assertEqual(result.a["href"], "Xiao Yan.html")
+        self.assertEqual(result.script.string, "Xiao Yan")
+        self.assertEqual(result.pre.get_text(), "Xiao Yan")
+        self.assertIn("<!-- Xiao Yan -->", str(result))
+        self.assertEqual(session.replacements, 2)
+
+    def test_html_block_boundaries_are_not_joined_into_names(self):
+        session = bot.TranslationSession(self.engine)
+        result = bot.translate_markup('<p>Xiao </p><p>Yan</p><p>Xiao <br/>Yan</p>', session, "test")
+        self.assertNotIn("Arjun", result)
+        self.assertEqual(session.replacements, 0)
+
+    def test_epub_preserves_links_mimetype_binary_and_namespace(self):
+        source, target = self.paths(".epub")
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("chapter.xhtml", '<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+                             '<p>Xiao <b>Yan</b></p><a href="Xiao Yan.xhtml">next</a></body></html>')
+            archive.writestr("mimetype", "application/epub+zip")
+            archive.writestr("image.bin", b"Xiao Yan\x00\xff")
+        session = bot.TranslationSession(self.engine)
+        bot.process_epub(source, target, session)
+        with zipfile.ZipFile(target) as archive:
+            self.assertEqual(archive.namelist()[0], "mimetype")
+            self.assertEqual(archive.getinfo("mimetype").compress_type, zipfile.ZIP_STORED)
+            self.assertEqual(archive.read("image.bin"), b"Xiao Yan\x00\xff")
+            soup = bot.BeautifulSoup(archive.read("chapter.xhtml"), "xml")
+            self.assertEqual(soup.p.get_text(), "Arjun Sharma")
+            self.assertEqual(soup.a["href"], "Xiao Yan.xhtml")
+            self.assertEqual(soup.html["xmlns"], "http://www.w3.org/1999/xhtml")
+        self.assertEqual(session.replacements, 1)
+
+
+class StartupOrderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_binds_before_database_engine_and_telegram(self):
+        events = []
+        runner = SimpleNamespace(cleanup=AsyncMock())
+        async def bind():
+            events.append("http")
+            return runner
+        async def fail_start():
+            events.append("telegram")
+            raise OSError("offline")
+        with patch.object(bot, "app", fake_client(asyncio.get_running_loop())), \
+             patch.object(bot, "_validate_config"), \
+             patch.object(bot, "start_web_server", side_effect=bind), \
+             patch.object(bot, "init_db", side_effect=lambda: events.append("database")), \
+             patch.object(bot, "load_custom_maps", side_effect=lambda: events.append("custom")), \
+             patch.object(bot, "generate_and_load_mapping", side_effect=lambda: events.append("engine")), \
+             patch.object(bot, "_start_telegram", side_effect=fail_start), \
+             patch.object(bot, "_close_telegram", new_callable=AsyncMock):
+            with self.assertRaises(OSError):
+                await bot.main()
+        self.assertEqual(events, ["http", "database", "custom", "engine", "telegram"])
+        runner.cleanup.assert_awaited_once()
+
+    async def test_stage_progression_and_health_expose_stage(self):
+        stages = []
+        runner = SimpleNamespace(cleanup=AsyncMock())
+        original = bot._set_stage
+        def record(stage):
+            original(stage)
+            stages.append(stage)
+        async def fail_start():
+            response = await bot.web_handler(SimpleNamespace(path="/health"))
+            self.assertEqual(response.status, 503)
+            self.assertEqual(json.loads(response.text)["stage"], "connect_telegram")
+            raise OSError("offline")
+        with patch.object(bot, "app", fake_client(asyncio.get_running_loop())), \
+             patch.object(bot, "_validate_config"), patch.object(bot, "_set_stage", side_effect=record), \
+             patch.object(bot, "start_web_server", AsyncMock(return_value=runner)), \
+             patch.object(bot, "init_db"), patch.object(bot, "load_custom_maps"), \
+             patch.object(bot, "generate_and_load_mapping"), \
+             patch.object(bot, "_start_telegram", side_effect=fail_start), \
+             patch.object(bot, "_close_telegram", new_callable=AsyncMock):
+            with self.assertRaises(OSError):
+                await bot.main()
+        self.assertEqual(stages, ["bind_http", "init_database", "build_name_engine", "connect_telegram"])
+        self.assertFalse([t for t in asyncio.all_tasks() if t.get_coro().__name__ == "_startup_heartbeat"])
+
+    async def test_startup_heartbeat_logs_stage_and_is_cancelled_when_ready(self):
+        loop = asyncio.get_running_loop()
+        callbacks = {}
+        runner = SimpleNamespace(cleanup=AsyncMock())
+        async def set_commands():
+            # Fire SIGTERM only after main() has marked itself ready.
+            loop.call_later(0.02, callbacks[signal.SIGTERM])
+        async def slow_connect():
+            await asyncio.sleep(0.05)
+        with patch.object(bot, "STARTUP_HEARTBEAT_S", 0.01), \
+             patch.object(bot, "app", fake_client(loop)), \
+             patch.object(loop, "add_signal_handler", side_effect=lambda s, fn: callbacks.update({s: fn})), \
+             patch.object(loop, "remove_signal_handler"), patch.object(bot, "_validate_config"), \
+             patch.object(bot, "init_db"), patch.object(bot, "load_custom_maps"), \
+             patch.object(bot, "generate_and_load_mapping"), \
+             patch.object(bot, "start_web_server", AsyncMock(return_value=runner)), \
+             patch.object(bot, "_start_telegram", side_effect=slow_connect), \
+             patch.object(bot, "_set_bot_commands", side_effect=set_commands), \
+             patch.object(bot, "_close_telegram", new_callable=AsyncMock), \
+             self.assertLogs(bot.logger, level="WARNING") as logs:
+            await asyncio.wait_for(bot.main(), timeout=2)
+        self.assertTrue(any("Still starting: stage=connect_telegram" in line for line in logs.output))
+        self.assertEqual(bot._startup_stage, "ready")
+        self.assertFalse([t for t in asyncio.all_tasks() if t.get_coro().__name__ == "_startup_heartbeat"])
+
+    def test_stdout_is_line_buffered_without_u_flag(self):
+        script = "import sys; sys.path.insert(0, '.'); import bot; print(sys.stdout.line_buffering)"
+        result = subprocess.run([sys.executable, "-c", script], cwd=os.path.dirname(__file__),
+                                capture_output=True, text=True,
+                                env={**os.environ, "PYTHONUNBUFFERED": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "True")
+
+    async def test_configured_port_binds_all_interfaces(self):
+        runner = SimpleNamespace(setup=AsyncMock(), cleanup=AsyncMock())
+        site = SimpleNamespace(start=AsyncMock())
+        with patch.dict(os.environ, {"PORT": "12345"}), \
+             patch.object(bot.web, "AppRunner", return_value=runner), \
+             patch.object(bot.web, "TCPSite", return_value=site) as factory:
+            self.assertIs(await bot.start_web_server(), runner)
+        factory.assert_called_once_with(runner, "0.0.0.0", 12345)
+        site.start.assert_awaited_once()
+
+    async def test_invalid_ports_fail_fast(self):
+        for port in ("bad", "0", "65536", "-1", ""):
+            with self.subTest(port=port), patch.dict(os.environ, {"PORT": port}):
+                with self.assertRaises(ValueError):
+                    await bot.start_web_server()
+
+    async def test_file_handler_sends_report_and_cleans_files(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            status = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+            captured = []
+            async def download(**kwargs):
+                Path(kwargs["file_name"]).write_text("Xiao Yan met Xiao Zoravan.")
+            async def upload(path, **kwargs):
+                captured.append((Path(path).name, Path(path).read_text()))
+            message = SimpleNamespace(
+                document=SimpleNamespace(file_name="novel.txt", file_size=50),
+                from_user=SimpleNamespace(id=42, username="reader", first_name="Reader"),
+                id=10, chat=SimpleNamespace(id=42), reply=AsyncMock(return_value=status),
+                download=AsyncMock(side_effect=download), reply_document=AsyncMock(side_effect=upload),
+            )
+            client = SimpleNamespace(send_chat_action=AsyncMock())
+            engine = bot.NameEngine({"Xiao Yan": "Arjun Sharma"}, {})
+            with patch.multiple(bot, DOWNLOAD_DIR=directory, _engine=engine, compiled_pattern=engine.pattern), \
+                 patch.object(bot, "is_rate_limited", return_value=0), \
+                 patch.object(bot, "add_user"), patch.object(bot, "increment_user_stats") as stats:
+                await bot.handle_document(client, message)
+            self.assertEqual(len(captured), 2)
+            self.assertIn("Arjun Sharma", captured[0][1])
+            self.assertTrue(captured[1][0].endswith(".character_report.json"))
+            self.assertEqual(json.loads(captured[1][1])["summary"]["total_replacements"], 1)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            stats.assert_called_once_with(42)
+            status.delete.assert_awaited_once()
 
 def tearDownModule():
     if not bot._APP_LOOP.is_closed():
