@@ -1,5 +1,21 @@
-pyrogram
-tgcrypto
-aiohttp
-python-docx
-beautifulsoup4
+# =====================================================================
+#  Advanced Novel Translator Bot — Dependencies
+# =====================================================================
+#  ⚠️  IMPORTANT — "pyrogram" (official, by Dan) is UNMAINTAINED and
+#      crashes on Python 3.12+ with:
+#          RuntimeError: There is no current event loop in thread 'MainThread'
+#
+#  ✅  We use "kurigram" — the actively-maintained Pyrogram fork.
+#      It is a drop-in replacement (import stays `import pyrogram`),
+#      supports Python 3.12 / 3.13, and fixes the event-loop bug.
+#      DO NOT install "pyrogram" and "kurigram" together.
+# =====================================================================
+
+kurigram==2.2.14
+tgcrypto==1.2.5
+
+aiohttp==3.10.11
+python-docx==1.1.2
+beautifulsoup4==4.12.3
+lxml==5.3.0
+python-dotenv==1.0.1
