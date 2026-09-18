@@ -17,13 +17,15 @@ services:
     plan: free
     region: singapore          # change to a region near you (oregon, frankfurt, ...)
     buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
-    startCommand: "python bot.py"
+    startCommand: "python -u bot.py"
     # Readiness: returns 503 until Telegram and the translation engine are ready.
     healthCheckPath: /health
     autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: API_ID
         sync: false            # set the real value in the dashboard
       - key: API_HASH
