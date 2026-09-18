@@ -38,18 +38,11 @@ import platform
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Tuple
 
-# ---------------------------------------------------------------------
-# ⚙️  EVENT-LOOP SAFETY SHIM  (fixes the Render crash!)
-# ---------------------------------------------------------------------
-#  On Python 3.12+ `asyncio.get_event_loop()` raises:
-#     RuntimeError: There is no current event loop in thread 'MainThread'
-#  Old Pyrogram calls it at IMPORT time, so the bot dies instantly.
-#  We proactively install a loop on the main thread BEFORE importing
-#  Pyrogram so that even a legacy version can import cleanly.
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+# Pyrogram imports and handler registration can capture the current loop.
+# Own ONE loop from import through shutdown; asyncio.run(main()) would create
+# a second loop and cause "Future attached to a different loop" on Telegram I/O.
+_APP_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(_APP_LOOP)
 
 # --- Optional .env support for local development ---------------------
 try:
@@ -62,7 +55,7 @@ import docx
 from bs4 import BeautifulSoup
 from aiohttp import web
 
-from pyrogram import Client, filters, idle, __version__ as PYRO_VERSION
+from pyrogram import Client, filters, __version__ as PYRO_VERSION
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, BotCommand
@@ -95,9 +88,15 @@ ADMIN_ID  = _env_int("ADMIN_ID", 0)
 
 DB_FILE      = os.environ.get("DB_FILE", "bot_stats.db")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
-MAX_FILE_MB  = _env_int("MAX_FILE_MB", 50)
-RATE_LIMIT_S = _env_int("RATE_LIMIT_S", 15)   # ek user X sec mein sirf 1 file
+MAX_FILE_MB  = max(1, _env_int("MAX_FILE_MB", 50))
+RATE_LIMIT_S = max(0, _env_int("RATE_LIMIT_S", 15))   # ek user X sec mein sirf 1 file
 LOG_FILE     = os.environ.get("LOG_FILE", "bot.log")
+CONNECT_RETRIES = min(10, max(1, _env_int("CONNECT_RETRIES", 5)))
+CONNECT_TIMEOUT_S = max(5, _env_int("CONNECT_TIMEOUT_S", 60))
+SHUTDOWN_TIMEOUT_S = max(5, _env_int("SHUTDOWN_TIMEOUT_S", 15))
+_started_at = time.monotonic()
+_lifecycle = "starting"
+_connect_attempt = 0
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -130,7 +129,8 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     workers=16,                 # zyada concurrent users handle karega
-    sleep_threshold=60          # FloodWait ke liye auto-sleep
+    sleep_threshold=60,         # FloodWait ke liye auto-sleep
+    loop=_APP_LOOP
 )
 
 # Global engines
@@ -687,7 +687,7 @@ async def clearmap_cmd(client: Client, message: Message):
 
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_cmd(client: Client, message: Message):
-    if ADMIN_ID and message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return await message.reply("⚠️ Yeh command sirf Admin ke liye hai.")
     total_users, total_files = get_stats()
     await message.reply(
@@ -702,7 +702,7 @@ async def stats_cmd(client: Client, message: Message):
 
 @app.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_cmd(client: Client, message: Message):
-    if ADMIN_ID and message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return await message.reply("⚠️ Yeh command sirf Admin ke liye hai.")
     try:
         text = message.text.split(None, 1)[1]
@@ -831,19 +831,34 @@ async def handle_document(client: Client, message: Message):
             quote=True, parse_mode=ParseMode.MARKDOWN
         )
 
+    # Apply the upload limit to dictionaries as well as novel files.
+    if doc.file_size and doc.file_size > MAX_FILE_MB * 1024 * 1024:
+        return await message.reply(
+            f"File limit: {MAX_FILE_MB} MB. Kripya choti file bhejein.", quote=True
+        )
+
     # ---- (A) Custom JSON dictionary ----
     if file_name.endswith(".json"):
         status = await message.reply("⏳ JSON dictionary load ho rahi hai...", quote=True)
-        tmp = os.path.join(DOWNLOAD_DIR, f"{user_id}_custom.json")
+        tmp = os.path.join(DOWNLOAD_DIR, f"{user_id}_{message.id}_custom.json")
         try:
             await message.download(file_name=tmp)
             with open(tmp, "r", encoding="utf-8") as f:
                 new_map = json.load(f)
             if not isinstance(new_map, dict):
                 raise ValueError("JSON root ek object hona chahiye")
-            for k, v in new_map.items():
-                custom_mapping_dict[str(k)] = str(v)
-                save_custom_map(str(k), str(v))
+            if len(new_map) > 5000 or any(
+                not isinstance(k, str) or not isinstance(v, str)
+                or not k.strip() or not v.strip() or len(k) > 200 or len(v) > 200
+                for k, v in new_map.items()
+            ):
+                raise ValueError("Use at most 5000 non-empty string pairs (200 characters each)")
+            with _db() as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO custom_maps (chinese, indian) VALUES (?,?)",
+                    new_map.items(),
+                )
+            custom_mapping_dict.update(new_map)
             build_regex_engine()
             await status.edit_text(
                 f"✅ **Custom Dictionary Updated!**\n\n"
@@ -879,8 +894,8 @@ async def handle_document(client: Client, message: Message):
 
     chat_id = message.chat.id
     safe_name = re.sub(r"[^\w.\-]", "_", doc.file_name or "novel")
-    old_path = os.path.join(DOWNLOAD_DIR, f"{chat_id}_in_{safe_name}")
-    new_path = os.path.join(DOWNLOAD_DIR, f"{chat_id}_out_{safe_name}")
+    old_path = os.path.join(DOWNLOAD_DIR, f"{chat_id}_{message.id}_in_{safe_name}")
+    new_path = os.path.join(DOWNLOAD_DIR, f"{chat_id}_{message.id}_out_{safe_name}")
 
     status = await message.reply("⏳ **Step 1/3:** File download ho rahi hai...",
                                  quote=True, parse_mode=ParseMode.MARKDOWN)
@@ -908,7 +923,6 @@ async def handle_document(client: Client, message: Message):
                 parse_mode=ParseMode.MARKDOWN
             )
 
-        increment_user_stats(user_id)
         await status.edit_text("📤 **Step 3/3:** Nayi file upload ho rahi hai...",
                                parse_mode=ParseMode.MARKDOWN)
 
@@ -931,6 +945,8 @@ async def handle_document(client: Client, message: Message):
             progress=_progress,
             progress_args=(status, "📤 **Uploading...**")
         )
+        add_user(user_id, message.from_user.username, message.from_user.first_name)
+        increment_user_stats(user_id)
         await status.delete()
 
     except FloodWait as e:
@@ -952,26 +968,53 @@ async def handle_document(client: Client, message: Message):
 # 13. WEB SERVER  (Render/Koyeb health-check ke liye)
 # =====================================================================
 
+def telegram_ready() -> bool:
+    session = getattr(app, "session", None)
+    return bool(
+        _lifecycle == "ready" and app.is_connected and app.is_initialized
+        and session and session.is_started.is_set()
+    )
+
+
 async def web_handler(request):
-    total = len(mapping_dict) + len(custom_mapping_dict)
+    ready = telegram_ready() and compiled_pattern is not None
+    # Liveness stays available during startup. Readiness must reflect Telegram,
+    # not merely the fact that aiohttp bound its port.
+    status = 200 if request.path == "/" or ready else 503
     return web.json_response({
-        "status": "running",
+        "status": "ready" if ready else (
+            "degraded" if _lifecycle == "ready" else _lifecycle
+        ),
         "bot": "Advanced Novel Translator",
-        "mappings": total,
-        "engine_ready": compiled_pattern is not None
-    })
+        "mappings": len(mapping_dict) + len(custom_mapping_dict),
+        "engine_ready": compiled_pattern is not None,
+        "telegram_connected": telegram_ready(),
+        "connect_attempt": _connect_attempt,
+        "uptime_seconds": int(time.monotonic() - _started_at),
+    }, status=status, headers={"Cache-Control": "no-store"})
+
+
+async def ping_handler(request):
+    return web.Response(text="pong")
 
 
 async def start_web_server() -> web.AppRunner:
     port = _env_int("PORT", 8080)
+    if not 1 <= port <= 65535:
+        raise ValueError("PORT must be between 1 and 65535")
     web_app = web.Application()
     web_app.router.add_get("/", web_handler)
     web_app.router.add_get("/health", web_handler)
-    web_app.router.add_get("/ping", lambda r: web.Response(text="pong"))
+    web_app.router.add_get("/ready", web_handler)
+    web_app.router.add_get("/ping", ping_handler)
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    try:
+        await site.start()
+    except BaseException:
+        await runner.cleanup()
+        raise
     logger.info(f"🌐 Web server live on port {port} (/health endpoint ready)")
     return runner
 
@@ -983,7 +1026,7 @@ async def start_web_server() -> web.AppRunner:
 def _validate_config():
     """Startup se pehle zaroori env variables check karta hai."""
     missing = []
-    if not API_ID:
+    if API_ID <= 0:
         missing.append("API_ID")
     if not API_HASH:
         missing.append("API_HASH")
@@ -1015,86 +1058,142 @@ async def _set_bot_commands():
         logger.warning(f"⚠️ set_bot_commands fail hua (ignore kar rahe hain): {e}")
 
 
+async def _close_telegram():
+    """Close initialized or partially connected clients within a fixed budget.
+
+    Cleanup failure is fatal during retries: never start on a dirty session.
+    """
+    async with asyncio.timeout(SHUTDOWN_TIMEOUT_S):
+        if app.is_initialized:
+            await app.stop(clear_handlers=False)
+        elif app.is_connected:
+            await app.disconnect()
+        else:
+            if app.session is not None:
+                await app.session.stop()
+                app.session = None
+            if getattr(app.storage, "conn", None) is not None:
+                await app.storage.close()
+                app.storage.conn = None
+
+
+async def _start_telegram():
+    global _connect_attempt
+    if asyncio.get_running_loop() is not app.loop:
+        raise RuntimeError("Telegram must run on its original event loop; use run_bot()")
+
+    for attempt in range(1, CONNECT_RETRIES + 1):
+        _connect_attempt = attempt
+        try:
+            async with asyncio.timeout(CONNECT_TIMEOUT_S):
+                await app.start()
+            return
+        except TimeoutError:
+            # Cancellation can interrupt Kurigram inside an unassigned session.
+            # Exit and let the supervisor restart rather than reuse that state.
+            logger.error("Telegram startup timed out after %ss", CONNECT_TIMEOUT_S)
+            raise
+        except (OSError, RPCError) as error:
+            # Bad credentials and programming errors will not improve on retry.
+            transient = isinstance(error, OSError) or getattr(error, "CODE", 0) >= 500
+            if isinstance(error, FloodWait):
+                delay = int(error.value) + 1
+                transient = delay <= 60
+            else:
+                delay = min(5 * 2 ** (attempt - 1), 30) + random.uniform(0, 1)
+            if not transient or attempt == CONNECT_RETRIES:
+                raise
+            await _close_telegram()
+            logger.warning("Telegram connection failed (%s), attempt %s/%s; retry in %.1fs",
+                           type(error).__name__, attempt, CONNECT_RETRIES, delay)
+            await asyncio.sleep(delay)
+
+
 async def main():
+    global _lifecycle
     _validate_config()
+    if asyncio.get_running_loop() is not app.loop:
+        raise RuntimeError("Client and main must share one event loop; use run_bot()")
 
-    logger.info("=" * 60)
-    logger.info("🚀 Advanced Novel Translator Bot start ho raha hai...")
-    logger.info(f"   Python {platform.python_version()} | Pyrogram {PYRO_VERSION}")
-    logger.info("=" * 60)
-
-    init_db()
-    load_custom_maps()
-    generate_and_load_mapping()
-
-    web_runner = await start_web_server()
-
-    # --- Telegram connect with retry (network flake par bhi crash nahi) ---
-    for attempt in range(1, 6):
-        try:
-            await app.start()
-            break
-        except Exception as e:
-            wait = min(attempt * 5, 30)
-            logger.error(f"⚠️ Telegram connect fail (try {attempt}/5): {e} "
-                         f"— {wait}s baad retry...")
-            await asyncio.sleep(wait)
-    else:
-        logger.critical("❌ Telegram se 5 baar connect nahi ho paya. Band kar rahe hain.")
-        await web_runner.cleanup()
-        raise SystemExit(1)
-
-    me = await app.get_me()
-    logger.info(f"🤖 Bot online: @{me.username} (id: {me.id})")
-    await _set_bot_commands()
-
-    # --- Graceful shutdown signals (SIGINT / SIGTERM) ---
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
     stop_event = asyncio.Event()
+    installed_signals = []
+    web_runner = None
+    _lifecycle = "starting"
 
-    def _request_stop(*_):
-        logger.info("🛑 Shutdown signal mila — safely band kar rahe hain...")
-        stop_event.set()
+    def request_stop():
+        if not stop_event.is_set():
+            logger.info("Shutdown requested")
+            stop_event.set()
+            # Interrupt startup, retry sleep, or the normal idle wait immediately.
+            main_task.cancel()
 
-    loop = asyncio.get_event_loop()
-    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
-        if sig is None:
-            continue
+    for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _request_stop)
+            loop.add_signal_handler(sig, request_stop)
+            installed_signals.append(sig)
         except (NotImplementedError, RuntimeError):
-            # Windows / kuch env signal handlers support nahi karte
             pass
 
-    logger.info("✅ Bot poori tarah taiyaar hai. Messages ka intezaar...")
-
-    # idle() aur stop_event dono mein se jo pehle aaye
     try:
-        idle_task = asyncio.create_task(idle())
-        stop_task = asyncio.create_task(stop_event.wait())
-        await asyncio.wait({idle_task, stop_task},
-                           return_when=asyncio.FIRST_COMPLETED)
+        logger.info("Starting NovelBot | Python %s | Kurigram %s | single event loop",
+                    platform.python_version(), PYRO_VERSION)
+        init_db()
+        load_custom_maps()
+        generate_and_load_mapping()
+        web_runner = await start_web_server()
+        await _start_telegram()
+        # start() already retrieves the bot identity; avoid an extra API call.
+        logger.info("Bot online: @%s (id: %s)", app.me.username, app.me.id)
+        try:
+            async with asyncio.timeout(15):
+                await _set_bot_commands()
+        except (TimeoutError, OSError):
+            logger.warning("Command menu setup unavailable; bot will still serve messages")
+        _lifecycle = "ready"
+        logger.info("Telegram and translation engine ready")
+        await stop_event.wait()
+    except asyncio.CancelledError:
+        if not stop_event.is_set():
+            raise
+    except Exception:
+        _lifecycle = "failed"
+        raise
     finally:
-        for t in (idle_task, stop_task):
-            if not t.done():
-                t.cancel()
+        _lifecycle = "stopping"
         try:
-            await app.stop()
+            await _close_telegram()
         except Exception:
-            pass
-        try:
-            await web_runner.cleanup()
-        except Exception:
-            pass
-        logger.info("👋 Bot safely band ho gaya.")
+            logger.exception("Telegram cleanup failed; remaining tasks will be cancelled")
+        finally:
+            try:
+                if web_runner is not None:
+                    await web_runner.cleanup()
+            finally:
+                for sig in installed_signals:
+                    loop.remove_signal_handler(sig)
+                _lifecycle = "stopped"
+                logger.info("Bot stopped")
+
+
+def run_bot():
+    # Runner closes pending tasks, async generators and the thread executor,
+    # but unlike asyncio.run it is explicitly given the import-time client loop.
+    try:
+        with asyncio.Runner(loop_factory=lambda: _APP_LOOP) as runner:
+            runner.run(main())
+    finally:
+        asyncio.set_event_loop(None)
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        run_bot()
     except KeyboardInterrupt:
-        logger.info("👋 KeyboardInterrupt — bye!")
+        logger.info("KeyboardInterrupt - stopped")
     except SystemExit:
         raise
-    except Exception as e:
-        logger.critical(f"💥 Fatal error: {e}", exc_info=True)
+    except Exception:
+        logger.critical("Fatal bot error", exc_info=True)
         sys.exit(1)
